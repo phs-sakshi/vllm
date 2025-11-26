@@ -4,14 +4,14 @@
 Integration tests for SSD offloading using a non-gated model.
 """
 
+import multiprocessing
+import os
 import socket
 import tempfile
 
 import pytest
-import torch
 
-# Check if CUDA and kvikio are available
-CUDA_AVAILABLE = torch.cuda.is_available()
+# Check if kvikio is available (without touching CUDA yet)
 KVIKIO_AVAILABLE = False
 try:
     import kvikio
@@ -19,8 +19,15 @@ try:
 except ImportError:
     pass
 
+
+def _check_cuda_available():
+    """Check CUDA availability without initializing it."""
+    import torch
+    return torch.cuda.is_available()
+
+
 skip_if_no_cuda = pytest.mark.skipif(
-    not CUDA_AVAILABLE,
+    not _check_cuda_available(),
     reason="CUDA is not available"
 )
 
@@ -36,6 +43,7 @@ def test_ssd_offloading_opt():
     """
     Tests SSD offloading with facebook/opt-125m (no authentication required).
     """
+    import torch
     from vllm import LLM
     from vllm.config import KVEventsConfig, KVTransferConfig
 
@@ -67,6 +75,7 @@ def test_ssd_offloading_opt():
             topic="test",
         )
 
+        llm = None
         try:
             # Use facebook/opt-125m which doesn't require authentication
             llm = LLM(
@@ -99,7 +108,8 @@ def test_ssd_offloading_opt():
 
         finally:
             # Cleanup
-            del llm
+            if llm is not None:
+                del llm
             torch.cuda.empty_cache()
 
 
@@ -109,6 +119,7 @@ def test_ssd_offloading_repeated_prompts():
     """
     Tests SSD offloading with repeated prompts to exercise cache hits.
     """
+    import torch
     from vllm import LLM
     from vllm.config import KVEventsConfig, KVTransferConfig
 
@@ -137,6 +148,7 @@ def test_ssd_offloading_repeated_prompts():
             topic="test",
         )
 
+        llm = None
         try:
             llm = LLM(
                 model="facebook/opt-125m",
@@ -165,10 +177,38 @@ def test_ssd_offloading_repeated_prompts():
             print("Repeated prompts test PASSED!")
 
         finally:
-            del llm
+            if llm is not None:
+                del llm
             torch.cuda.empty_cache()
 
 
+def _run_test_in_subprocess(test_func):
+    """Run a test function in a subprocess to avoid CUDA initialization issues."""
+    import sys
+    
+    def wrapper():
+        # Set environment variables to help with CUDA
+        os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+        test_func()
+    
+    ctx = multiprocessing.get_context("spawn")
+    p = ctx.Process(target=wrapper)
+    p.start()
+    p.join()
+    
+    if p.exitcode != 0:
+        raise RuntimeError(f"Test failed with exit code {p.exitcode}")
+
+
 if __name__ == "__main__":
-    test_ssd_offloading_opt()
-    test_ssd_offloading_repeated_prompts()
+    # Must set spawn method BEFORE any CUDA operations
+    # This is required because vLLM uses multiprocessing internally
+    multiprocessing.set_start_method("spawn", force=True)
+    
+    print("Running test_ssd_offloading_opt...")
+    _run_test_in_subprocess(test_ssd_offloading_opt)
+    
+    print("\nRunning test_ssd_offloading_repeated_prompts...")
+    _run_test_in_subprocess(test_ssd_offloading_repeated_prompts)
+    
+    print("\nAll integration tests completed!")
