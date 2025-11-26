@@ -236,8 +236,13 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                         else:
                             block_data = gpu_tensor[src_idx, ...].contiguous().clone()
 
-                        # Write to SSD using GDS
-                        ssd_file.pwrite(block_data, file_offset)
+                        # Write to SSD using GDS - pwrite returns IOFuture, call .get() to wait
+                        future = ssd_file.pwrite(block_data, file_offset)
+                        nbytes = future.get()  # Wait for I/O to complete
+                        if nbytes != block_data.nbytes:
+                            raise RuntimeError(
+                                f"Incomplete write: expected {block_data.nbytes}, got {nbytes}"
+                            )
 
             return True
         except Exception as e:
@@ -275,8 +280,13 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                                 device=gpu_tensor.device,
                             )
 
-                            # Read from SSD
-                            ssd_file.pread(buffer, file_offset)
+                            # Read from SSD - pread returns IOFuture, call .get() to wait
+                            future = ssd_file.pread(buffer, file_offset)
+                            nbytes = future.get()  # Wait for I/O to complete
+                            if nbytes != buffer.nbytes:
+                                raise RuntimeError(
+                                    f"Incomplete read: expected {buffer.nbytes}, got {nbytes}"
+                                )
 
                             # Copy to GPU cache
                             gpu_tensor[0, dst_idx, ...].copy_(buffer[0])
@@ -290,8 +300,13 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                                 device=gpu_tensor.device,
                             )
 
-                            # Read from SSD
-                            ssd_file.pread(buffer, file_offset)
+                            # Read from SSD - pread returns IOFuture, call .get() to wait
+                            future = ssd_file.pread(buffer, file_offset)
+                            nbytes = future.get()  # Wait for I/O to complete
+                            if nbytes != buffer.nbytes:
+                                raise RuntimeError(
+                                    f"Incomplete read: expected {buffer.nbytes}, got {nbytes}"
+                                )
 
                             # Copy to GPU cache
                             gpu_tensor[dst_idx, ...].copy_(buffer)
