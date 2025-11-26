@@ -326,9 +326,9 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                                     f"Incomplete read: expected {buffer.nbytes}, got {nbytes}"
                                 )
 
-                            # Copy to GPU cache
-                            gpu_tensor[0, dst_idx, ...].copy_(buffer[0])
-                            gpu_tensor[1, dst_idx, ...].copy_(buffer[1])
+                            # Copy to GPU cache (use .data to bypass inference mode check)
+                            gpu_tensor.data[0, dst_idx, ...].copy_(buffer[0])
+                            gpu_tensor.data[1, dst_idx, ...].copy_(buffer[1])
                         else:
                             # Create buffer for reading
                             block_shape = gpu_tensor[dst_idx, ...].shape
@@ -347,8 +347,8 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                                     f"Incomplete read: expected {buffer.nbytes}, got {nbytes}"
                                 )
 
-                            # Copy to GPU cache
-                            gpu_tensor[dst_idx, ...].copy_(buffer)
+                            # Copy to GPU cache (use .data to bypass inference mode check)
+                            gpu_tensor.data[dst_idx, ...].copy_(buffer)
 
             return True
         except Exception as e:
