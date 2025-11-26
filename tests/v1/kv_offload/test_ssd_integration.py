@@ -19,6 +19,8 @@ import tempfile
 
 import pytest
 
+from vllm import SamplingParams
+
 # Check if kvikio is available (without touching CUDA yet)
 KVIKIO_AVAILABLE = False
 try:
@@ -116,7 +118,7 @@ def test_ssd_offloading_opt():
                 "Once upon a time",
             ]
             
-            outputs = llm.generate(prompts, sampling_params={"max_tokens": 20})
+            outputs = llm.generate(prompts, SamplingParams(max_tokens=20))
             
             # Verify we got outputs
             assert len(outputs) == len(prompts)
@@ -185,12 +187,12 @@ def test_ssd_offloading_repeated_prompts():
             prompt = "The meaning of life is"
             
             # First run
-            outputs1 = llm.generate([prompt], sampling_params={"max_tokens": 10, "seed": 42})
+            outputs1 = llm.generate([prompt], SamplingParams(max_tokens=10, seed=42))
             result1 = outputs1[0].outputs[0].text
             print(f"First run: {result1!r}")
 
             # Second run with same prompt (should potentially hit cache)
-            outputs2 = llm.generate([prompt], sampling_params={"max_tokens": 10, "seed": 42})
+            outputs2 = llm.generate([prompt], SamplingParams(max_tokens=10, seed=42))
             result2 = outputs2[0].outputs[0].text
             print(f"Second run: {result2!r}")
 
