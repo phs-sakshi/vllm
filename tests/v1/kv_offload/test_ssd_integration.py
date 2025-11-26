@@ -2,9 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Integration tests for SSD offloading using a non-gated model.
+
+Usage:
+    python tests/v1/kv_offload/test_ssd_integration.py
+    
+Or with pytest:
+    python -m pytest tests/v1/kv_offload/test_ssd_integration.py -v -s
 """
 
-import multiprocessing
 import os
 import socket
 import tempfile
@@ -182,33 +187,16 @@ def test_ssd_offloading_repeated_prompts():
             torch.cuda.empty_cache()
 
 
-def _run_test_in_subprocess(test_func):
-    """Run a test function in a subprocess to avoid CUDA initialization issues."""
+if __name__ == "__main__":
+    import multiprocessing
     import sys
     
-    def wrapper():
-        # Set environment variables to help with CUDA
-        os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-        test_func()
-    
-    ctx = multiprocessing.get_context("spawn")
-    p = ctx.Process(target=wrapper)
-    p.start()
-    p.join()
-    
-    if p.exitcode != 0:
-        raise RuntimeError(f"Test failed with exit code {p.exitcode}")
-
-
-if __name__ == "__main__":
     # Must set spawn method BEFORE any CUDA operations
     # This is required because vLLM uses multiprocessing internally
-    multiprocessing.set_start_method("spawn", force=True)
+    try:
+        multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass  # Already set
     
-    print("Running test_ssd_offloading_opt...")
-    _run_test_in_subprocess(test_ssd_offloading_opt)
-    
-    print("\nRunning test_ssd_offloading_repeated_prompts...")
-    _run_test_in_subprocess(test_ssd_offloading_repeated_prompts)
-    
-    print("\nAll integration tests completed!")
+    # Run tests using pytest which handles this properly
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
