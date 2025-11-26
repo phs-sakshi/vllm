@@ -180,13 +180,18 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
             # Pre-allocate the cache file - need space for all SSD blocks
             # Each SSD block = block_size_factor GPU blocks
             total_size = gpu_block_size_bytes * self.block_size_factor * num_ssd_blocks
+            max_gpu_block_index = self.block_size_factor * num_ssd_blocks - 1
             self._create_cache_file(cache_file_path, total_size)
 
-            logger.debug(
-                "Layer %d: gpu_block_size=%d bytes, total=%d bytes, file=%s",
+            logger.info(
+                "Layer %d: gpu_shape=%s, block_size_bytes=%d, total_size=%d bytes, "
+                "block_size_factor=%d, max_gpu_block_idx=%d, file=%s",
                 layer_idx,
+                list(gpu_shape),
                 gpu_block_size_bytes,
                 total_size,
+                self.block_size_factor,
+                max_gpu_block_index,
                 cache_file_path,
             )
 
@@ -199,7 +204,16 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                 except (AttributeError, OSError):
                     f.seek(size - 1)
                     f.write(b"\0")
-            logger.debug("Created cache file %s with size %d bytes", path, size)
+            # Verify file was created with correct size
+            actual_size = os.path.getsize(path)
+            logger.info(
+                "Created cache file %s: requested=%d bytes, actual=%d bytes",
+                path, size, actual_size
+            )
+            if actual_size != size:
+                raise RuntimeError(
+                    f"File size mismatch: expected {size}, got {actual_size}"
+                )
         except Exception as e:
             logger.error("Failed to create cache file %s: %s", path, e)
             raise
@@ -219,6 +233,14 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                     self.kv_dim_before_num_blocks,
                 )
             ):
+                file_size = os.path.getsize(file_path)
+                logger.debug(
+                    "GPU→SSD layer %d: file_size=%d, block_size_bytes=%d, "
+                    "src_blocks=%s, dst_blocks=%s",
+                    layer_idx, file_size, block_size_bytes,
+                    src_block_ids.tolist(), dst_block_ids.tolist()
+                )
+
                 # Open file for this transfer
                 with _kvikio.CuFile(file_path, "r+") as ssd_file:
                     for src_block, dst_block in zip(src_block_ids, dst_block_ids):
@@ -235,6 +257,20 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                             ).contiguous()
                         else:
                             block_data = gpu_tensor[src_idx, ...].contiguous().clone()
+
+                        # Validate offset before write
+                        end_offset = file_offset + block_data.nbytes
+                        if end_offset > file_size:
+                            raise RuntimeError(
+                                f"Write would exceed file size: offset={file_offset}, "
+                                f"size={block_data.nbytes}, end={end_offset}, "
+                                f"file_size={file_size}, dst_idx={dst_idx}"
+                            )
+
+                        logger.debug(
+                            "Writing block: src=%d, dst=%d, offset=%d, size=%d",
+                            src_idx, dst_idx, file_offset, block_data.nbytes
+                        )
 
                         # Write to SSD using GDS - pwrite returns IOFuture, call .get() to wait
                         future = ssd_file.pwrite(block_data, file_offset)
@@ -333,6 +369,13 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
         assert src_blocks.ndim == 1
         assert dst_blocks.ndim == 1
 
+        logger.debug(
+            "transfer_async job=%d: is_read=%s, src_blocks=%s, dst_blocks=%s, "
+            "block_size_factor=%d, num_ssd_blocks=%d",
+            job_id, is_read, src_blocks.tolist(), dst_blocks.tolist(),
+            self.block_size_factor, self.num_ssd_blocks
+        )
+
         # Handle block size factor conversion
         if is_read:
             src_block_size_factor = self.block_size_factor
@@ -354,6 +397,12 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
             src_blocks, src_block_size_factor, expanded_src, skip_count=src_sub_blocks_to_skip
         )
         expand_block_ids(dst_blocks, dst_block_size_factor, expanded_dst)
+
+        logger.debug(
+            "Expanded: src=%s, dst=%s, max_dst=%d",
+            expanded_src.tolist(), expanded_dst.tolist(),
+            int(np.max(expanded_dst)) if len(expanded_dst) > 0 else -1
+        )
 
         # Submit async transfer
         if is_read:
