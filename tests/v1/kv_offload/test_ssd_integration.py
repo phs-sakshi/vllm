@@ -7,10 +7,13 @@ Usage:
     python tests/v1/kv_offload/test_ssd_integration.py
     
 Or with pytest:
-    python -m pytest tests/v1/kv_offload/test_ssd_integration.py -v -s
+    VLLM_WORKER_MULTIPROC_METHOD=spawn python -m pytest tests/v1/kv_offload/test_ssd_integration.py -v -s
 """
 
+# IMPORTANT: Set spawn method BEFORE any imports that might initialize CUDA
 import os
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
 import socket
 import tempfile
 
@@ -26,9 +29,24 @@ except ImportError:
 
 
 def _check_cuda_available():
-    """Check CUDA availability without initializing it."""
-    import torch
-    return torch.cuda.is_available()
+    """Check CUDA availability without initializing it.
+    
+    We check the environment variable rather than calling torch.cuda.is_available()
+    to avoid initializing CUDA before vLLM spawns its processes.
+    """
+    # Check if CUDA_VISIBLE_DEVICES is set and not empty
+    cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if cuda_devices == "":
+        # Not explicitly disabled, try a safe check
+        try:
+            # This might initialize CUDA on some systems, but it's needed for skip
+            import torch
+            return torch.cuda.is_available()
+        except Exception:
+            return False
+    elif cuda_devices == "-1":
+        return False
+    return True
 
 
 skip_if_no_cuda = pytest.mark.skipif(
@@ -188,15 +206,6 @@ def test_ssd_offloading_repeated_prompts():
 
 
 if __name__ == "__main__":
-    import multiprocessing
     import sys
-    
-    # Must set spawn method BEFORE any CUDA operations
-    # This is required because vLLM uses multiprocessing internally
-    try:
-        multiprocessing.set_start_method("spawn", force=True)
-    except RuntimeError:
-        pass  # Already set
-    
-    # Run tests using pytest which handles this properly
+    # Run tests using pytest
     sys.exit(pytest.main([__file__, "-v", "-s"]))
