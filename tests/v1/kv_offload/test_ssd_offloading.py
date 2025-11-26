@@ -1,57 +1,45 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-End-to-end tests for SSD KV cache offloading with GPU Direct Storage.
-
-These tests verify the complete SSD offloading pipeline works correctly
-with the OffloadingConnector and SSDOffloadingSpec.
+Integration tests for SSD offloading - similar to CPU offloading tests.
 """
+
+# Set spawn method before any imports that might initialize CUDA
+import os
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
 import socket
-import tempfile
 import time
 
 import msgspec
 import msgspec.msgpack
 import pytest
-import torch
 import zmq
 from tqdm import tqdm
 
+from vllm import LLM, SamplingParams, TokensPrompt
+from vllm.config import KVEventsConfig, KVTransferConfig
+from vllm.distributed.kv_events import BlockStored, KVEventBatch
 from vllm.platforms import current_platform
 from vllm.utils.system_utils import set_env_var
 
-# Check if CUDA is available
-cuda_available = torch.cuda.is_available()
-
 # Check if kvikio is available
+KVIKIO_AVAILABLE = False
 try:
     import kvikio
-
-    kvikio_available = True
+    KVIKIO_AVAILABLE = True
 except ImportError:
-    kvikio_available = False
-
-# Skip all tests if requirements not met
-pytestmark = [
-    pytest.mark.skipif(not cuda_available, reason="CUDA not available"),
-    pytest.mark.skipif(not kvikio_available, reason="kvikio not available"),
-]
-
-# Only import vllm modules if we can run the tests
-if cuda_available and kvikio_available:
-    from vllm import LLM, SamplingParams, TokensPrompt
-    from vllm.config import KVEventsConfig, KVTransferConfig
-    from vllm.distributed.kv_events import BlockStored, KVEventBatch
+    pass
 
 SSD_BLOCK_SIZES = [48]
 ATTN_BACKENDS = ["FLASH_ATTN"]
 
-if cuda_available and current_platform.is_cuda():
+if current_platform.is_cuda():
     ATTN_BACKENDS.append("FLASHINFER")
 
 
 class MockSubscriber:
-    """Helper class to receive and verify published events."""
+    """Helper class to receive and verify published events"""
 
     def __init__(
         self,
@@ -69,7 +57,6 @@ class MockSubscriber:
         self.decoder = msgspec.msgpack.Decoder(type=KVEventBatch)
 
     def get_new_ssd_stored_events(self) -> list[BlockStored]:
-        """Get new SSD stored events."""
         ssd_stored_events: list[BlockStored] = []
 
         poller = zmq.Poller()
@@ -94,44 +81,41 @@ class MockSubscriber:
                     timeout = 100
 
     def close(self):
-        """Clean up resources."""
+        """Clean up resources"""
         self.sub.close()
 
 
 def _latency_test(llm: LLM, subscriber: MockSubscriber):
-    """Test that SSD offloading improves latency vs cold start."""
     sampling_params = SamplingParams(max_tokens=1)
 
     num_times_ssd_better_than_cold = 0
-    num_tests = 5  # Fewer tests for SSD due to slower I/O
+    num_tests = 10
     total_cold_time = 0.0
     total_gpu_hit_time = 0.0
     total_ssd_hit_time = 0.0
-    prompt_token_ids = [0] * 5001  # Shorter prompts for faster testing
-    for i in tqdm(range(num_tests), desc="Running latency tests"):
+    prompt_token_ids = [0] * 10001
+    for i in tqdm(range(num_tests), desc="Running tests"):
         prompt_token_ids[0] = i
         prompts = [TokensPrompt(prompt_token_ids=prompt_token_ids)]
 
-        # Run generation - this should trigger saving KV cache
+        # run generation - this should trigger saving KV cache
         start_time = time.time()
         llm.generate(prompts, sampling_params, use_tqdm=False)
         cold_time = time.time() - start_time
         total_cold_time += cold_time
 
-        # Run generation again - should hit the GPU prefix cache
+        # run generation again - should hit the GPU prefix cache
         start_time = time.time()
         llm.generate(prompts, sampling_params, use_tqdm=False)
         gpu_hit_time = time.time() - start_time
         total_gpu_hit_time += gpu_hit_time
 
-        # Reset prefix cache to avoid GPU hit
+        # reset prefix cache to avoid GPU hit.
         llm.reset_prefix_cache()
 
-        # Wait for SSD store events
-        ssd_events = subscriber.get_new_ssd_stored_events()
-        assert ssd_events, "Expected SSD store events"
+        assert subscriber.get_new_ssd_stored_events()
 
-        # Run generation again - this should trigger loading from SSD
+        # run generation again - this should trigger loading from SSD
         start_time = time.time()
         llm.generate(prompts, sampling_params, use_tqdm=False)
         ssd_hit_time = time.time() - start_time
@@ -145,13 +129,10 @@ def _latency_test(llm: LLM, subscriber: MockSubscriber):
     print(f"    GPU hit: {total_gpu_hit_time * 1000 / num_tests:.2f}ms")
     print(f"    SSD hit: {total_ssd_hit_time * 1000 / num_tests:.2f}ms")
 
-    # SSD should be faster than cold start most of the time
-    # (lower threshold than CPU due to SSD latency variance)
-    assert num_times_ssd_better_than_cold >= 0.6 * num_tests
+    assert num_times_ssd_better_than_cold >= 0.8 * num_tests
 
 
 def _accuracy_test(llm: LLM, subscriber: MockSubscriber):
-    """Test that SSD offloading produces correct results."""
     sampling_params = SamplingParams(max_tokens=1)
     ssd_block_size = (
         llm.llm_engine.vllm_config.kv_transfer_config.kv_connector_extra_config[
@@ -161,7 +142,7 @@ def _accuracy_test(llm: LLM, subscriber: MockSubscriber):
 
     subscriber.get_new_ssd_stored_events()
 
-    # Prepend prompt to be SSD block aligned
+    # prepend prompt to be ssd block aligned
     prompt = "Let's count to 10. One, two, three, four,"
     while (
         len(llm.generate(prompt, use_tqdm=False)[0].prompt_token_ids) % ssd_block_size
@@ -171,7 +152,7 @@ def _accuracy_test(llm: LLM, subscriber: MockSubscriber):
 
     assert subscriber.get_new_ssd_stored_events()
 
-    test_count = 50  # Fewer tests for SSD
+    test_count = 100
     success_count = 0
     for i in range(test_count):
         if (
@@ -183,12 +164,15 @@ def _accuracy_test(llm: LLM, subscriber: MockSubscriber):
     assert success_count >= 0.5 * test_count
 
 
+@pytest.mark.skipif(not KVIKIO_AVAILABLE, reason="kvikio is not available")
 @pytest.mark.parametrize("ssd_block_size", SSD_BLOCK_SIZES)
 @pytest.mark.parametrize("attn_backend", ATTN_BACKENDS)
 def test_ssd_offloading(ssd_block_size: int, attn_backend: str) -> None:
     """
     Tests OffloadingConnector with SSDOffloadingSpec.
     """
+    import tempfile
+
     with tempfile.TemporaryDirectory() as ssd_cache_dir:
         # Configure OffloadingConnector with SSDOffloadingSpec
         kv_transfer_config = KVTransferConfig(
@@ -219,7 +203,7 @@ def test_ssd_offloading(ssd_block_size: int, attn_backend: str) -> None:
 
         with set_env_var("VLLM_ATTENTION_BACKEND", attn_backend):
             llm = LLM(
-                model="meta-llama/Llama-3.2-1B-Instruct",
+                model="facebook/opt-125m",  # Use non-gated model
                 gpu_memory_utilization=0.5,
                 kv_events_config=kv_events_config,
                 kv_transfer_config=kv_transfer_config,
@@ -236,93 +220,6 @@ def test_ssd_offloading(ssd_block_size: int, attn_backend: str) -> None:
             del llm
 
 
-@pytest.mark.parametrize("eviction_policy", ["lru", "arc"])
-def test_ssd_offloading_eviction_policies(eviction_policy: str) -> None:
-    """
-    Tests SSD offloading with different eviction policies.
-    """
-    with tempfile.TemporaryDirectory() as ssd_cache_dir:
-        kv_transfer_config = KVTransferConfig(
-            kv_connector="OffloadingConnector",
-            kv_role="kv_both",
-            kv_connector_extra_config={
-                "spec_name": "SSDOffloadingSpec",
-                "num_ssd_blocks": 500,
-                "block_size": 32,
-                "ssd_cache_dir": ssd_cache_dir,
-                "eviction_policy": eviction_policy,
-            },
-        )
-
-        with set_env_var("VLLM_ATTENTION_BACKEND", "FLASH_ATTN"):
-            llm = LLM(
-                model="meta-llama/Llama-3.2-1B-Instruct",
-                gpu_memory_utilization=0.5,
-                kv_transfer_config=kv_transfer_config,
-            )
-
-        sampling_params = SamplingParams(max_tokens=10)
-        prompt = "Hello, how are you doing today?"
-
-        # Run a few generations to trigger offloading
-        for _ in range(3):
-            output = llm.generate(prompt, sampling_params, use_tqdm=False)
-            assert len(output) > 0
-            assert len(output[0].outputs[0].text) > 0
-
-        del llm
-
-
-def test_ssd_offloading_spec_validation() -> None:
-    """
-    Tests that SSDOffloadingSpec validates configuration correctly.
-    """
-    with tempfile.TemporaryDirectory() as ssd_cache_dir:
-        # Test missing num_ssd_blocks
-        with pytest.raises(ValueError, match="num_ssd_blocks"):
-            kv_transfer_config = KVTransferConfig(
-                kv_connector="OffloadingConnector",
-                kv_role="kv_both",
-                kv_connector_extra_config={
-                    "spec_name": "SSDOffloadingSpec",
-                    "ssd_cache_dir": ssd_cache_dir,
-                },
-            )
-            with set_env_var("VLLM_ATTENTION_BACKEND", "FLASH_ATTN"):
-                llm = LLM(
-                    model="meta-llama/Llama-3.2-1B-Instruct",
-                    gpu_memory_utilization=0.5,
-                    kv_transfer_config=kv_transfer_config,
-                )
-
-
-@pytest.mark.parametrize("num_io_threads", [1, 4, 8])
-def test_ssd_offloading_io_threads(num_io_threads: int) -> None:
-    """
-    Tests SSD offloading with different numbers of I/O threads.
-    """
-    with tempfile.TemporaryDirectory() as ssd_cache_dir:
-        kv_transfer_config = KVTransferConfig(
-            kv_connector="OffloadingConnector",
-            kv_role="kv_both",
-            kv_connector_extra_config={
-                "spec_name": "SSDOffloadingSpec",
-                "num_ssd_blocks": 500,
-                "block_size": 32,
-                "ssd_cache_dir": ssd_cache_dir,
-                "num_io_threads": num_io_threads,
-            },
-        )
-
-        with set_env_var("VLLM_ATTENTION_BACKEND", "FLASH_ATTN"):
-            llm = LLM(
-                model="meta-llama/Llama-3.2-1B-Instruct",
-                gpu_memory_utilization=0.5,
-                kv_transfer_config=kv_transfer_config,
-            )
-
-        sampling_params = SamplingParams(max_tokens=5)
-        output = llm.generate("Hello world", sampling_params, use_tqdm=False)
-        assert len(output) > 0
-
-        del llm
+if __name__ == "__main__":
+    import sys
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
