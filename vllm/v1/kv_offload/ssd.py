@@ -25,7 +25,8 @@ from collections.abc import Iterator
 import torch
 
 from vllm.attention.backends.abstract import AttentionBackend
-from vllm.config import VllmConfig
+from vllm.attention.layer import Attention
+from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.kv_offload.abstract import LoadStoreSpec, OffloadingManager
@@ -152,13 +153,11 @@ class SSDOffloadingSpec(OffloadingSpec):
     def get_handlers(
         self,
         kv_caches: dict[str, torch.Tensor],
-        attn_backends: dict[str, type[AttentionBackend]],
     ) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]]:
         """Get offloading handlers for GPU-SSD transfers.
 
         Args:
             kv_caches: Dictionary mapping layer names to GPU KV cache tensors.
-            attn_backends: Dictionary mapping layer names to attention backends.
 
         Yields:
             Tuples of (src_type, dst_type, handler) for both directions:
@@ -171,6 +170,16 @@ class SSDOffloadingSpec(OffloadingSpec):
                     "SSD Offloading with GDS is only supported on CUDA-alike GPUs. "
                     f"Current platform: {current_platform}"
                 )
+
+            # Extract attn_backends from model layers
+            layer_names = list(kv_caches.keys())
+            layers = get_layers_from_vllm_config(
+                self.vllm_config, Attention, layer_names
+            )
+            attn_backends = {
+                layer_name: layers[layer_name].get_attn_backend()
+                for layer_name in layer_names
+            }
 
             self._handler = GpuSsdOffloadingHandler(
                 gpu_block_size=self.gpu_block_size,
