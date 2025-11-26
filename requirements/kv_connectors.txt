@@ -1,2 +1,3 @@
 lmcache
 nixl >= 0.7.1 # Required for disaggregated prefill
+kvikio-cu12 >= 24.04 # Required for SSD offloading with GPU Direct Storage

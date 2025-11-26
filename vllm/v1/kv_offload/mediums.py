@@ -37,3 +37,13 @@ class CPULoadStoreSpec(BlockIDsLoadStoreSpec):
     @staticmethod
     def medium() -> str:
         return "CPU"
+
+
+class SSDLoadStoreSpec(BlockIDsLoadStoreSpec):
+    """
+    Spec for loading/storing a KV block to SSD via GPU Direct Storage.
+    """
+
+    @staticmethod
+    def medium() -> str:
+        return "SSD"
