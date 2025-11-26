@@ -273,7 +273,8 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                         )
 
                         # Write to SSD using GDS - pwrite returns IOFuture, call .get() to wait
-                        future = ssd_file.pwrite(block_data, file_offset)
+                        # NOTE: Must use keyword args! pwrite(buf, size, file_offset, ...)
+                        future = ssd_file.pwrite(block_data, file_offset=file_offset)
                         nbytes = future.get()  # Wait for I/O to complete
                         if nbytes != block_data.nbytes:
                             raise RuntimeError(
@@ -317,7 +318,8 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                             )
 
                             # Read from SSD - pread returns IOFuture, call .get() to wait
-                            future = ssd_file.pread(buffer, file_offset)
+                            # NOTE: Must use keyword args! pread(buf, size, file_offset, ...)
+                            future = ssd_file.pread(buffer, file_offset=file_offset)
                             nbytes = future.get()  # Wait for I/O to complete
                             if nbytes != buffer.nbytes:
                                 raise RuntimeError(
@@ -337,7 +339,8 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                             )
 
                             # Read from SSD - pread returns IOFuture, call .get() to wait
-                            future = ssd_file.pread(buffer, file_offset)
+                            # NOTE: Must use keyword args! pread(buf, size, file_offset, ...)
+                            future = ssd_file.pread(buffer, file_offset=file_offset)
                             nbytes = future.get()  # Wait for I/O to complete
                             if nbytes != buffer.nbytes:
                                 raise RuntimeError(
