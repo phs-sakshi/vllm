@@ -326,9 +326,20 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                                     f"Incomplete read: expected {buffer.nbytes}, got {nbytes}"
                                 )
 
-                            # Copy to GPU cache (use .data to bypass inference mode check)
-                            gpu_tensor.data[0, dst_idx, ...].copy_(buffer[0])
-                            gpu_tensor.data[1, dst_idx, ...].copy_(buffer[1])
+                            # Copy to GPU cache using raw memory copy to bypass inference mode
+                            import cupy as cp
+                            
+                            # Get cupy arrays from torch tensors (zero-copy via DLPack)
+                            k_src = cp.from_dlpack(buffer[0].detach())
+                            v_src = cp.from_dlpack(buffer[1].detach())
+                            
+                            # Get target slices and convert to cupy
+                            k_dst = cp.from_dlpack(gpu_tensor[0, dst_idx, ...].detach())
+                            v_dst = cp.from_dlpack(gpu_tensor[1, dst_idx, ...].detach())
+                            
+                            # Copy using cupy (bypasses PyTorch inference mode)
+                            cp.copyto(k_dst, k_src)
+                            cp.copyto(v_dst, v_src)
                         else:
                             # Create buffer for reading
                             block_shape = gpu_tensor[dst_idx, ...].shape
@@ -347,8 +358,15 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                                     f"Incomplete read: expected {buffer.nbytes}, got {nbytes}"
                                 )
 
-                            # Copy to GPU cache (use .data to bypass inference mode check)
-                            gpu_tensor.data[dst_idx, ...].copy_(buffer)
+                            # Copy to GPU cache using raw memory copy to bypass inference mode
+                            import cupy as cp
+                            
+                            # Get cupy arrays from torch tensors (zero-copy via DLPack)
+                            src = cp.from_dlpack(buffer.detach())
+                            dst = cp.from_dlpack(gpu_tensor[dst_idx, ...].detach())
+                            
+                            # Copy using cupy (bypasses PyTorch inference mode)
+                            cp.copyto(dst, src)
 
             return True
         except Exception as e:
