@@ -29,6 +29,46 @@ logger = init_logger(__name__)
 _kvikio_available = None
 _kvikio = None
 
+# CUDA memcpy helper using ctypes
+_cudart = None
+
+
+def _cuda_memcpy(dst_ptr: int, src_ptr: int, size: int) -> None:
+    """
+    Perform a CUDA device-to-device memory copy using cudaMemcpy.
+    This bypasses PyTorch's inference mode restrictions.
+    """
+    global _cudart
+    if _cudart is None:
+        import ctypes
+        # Load CUDA runtime library
+        try:
+            _cudart = ctypes.CDLL("libcudart.so")
+        except OSError:
+            # Try with version suffix
+            import ctypes.util
+            cudart_path = ctypes.util.find_library("cudart")
+            if cudart_path:
+                _cudart = ctypes.CDLL(cudart_path)
+            else:
+                raise RuntimeError("Could not find CUDA runtime library")
+        
+        # Set up cudaMemcpy signature
+        # cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cudaMemcpyKind kind)
+        _cudart.cudaMemcpy.argtypes = [
+            ctypes.c_void_p,  # dst
+            ctypes.c_void_p,  # src
+            ctypes.c_size_t,  # count
+            ctypes.c_int,     # kind
+        ]
+        _cudart.cudaMemcpy.restype = ctypes.c_int
+    
+    # cudaMemcpyDeviceToDevice = 3
+    cudaMemcpyDeviceToDevice = 3
+    result = _cudart.cudaMemcpy(dst_ptr, src_ptr, size, cudaMemcpyDeviceToDevice)
+    if result != 0:
+        raise RuntimeError(f"cudaMemcpy failed with error code {result}")
+
 
 def _check_kvikio_available() -> bool:
     """Check if kvikio is available and GDS is supported."""
@@ -326,20 +366,17 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                                     f"Incomplete read: expected {buffer.nbytes}, got {nbytes}"
                                 )
 
-                            # Copy to GPU cache using raw memory copy to bypass inference mode
-                            import cupy as cp
-                            
-                            # Get cupy arrays from torch tensors (zero-copy via DLPack)
-                            k_src = cp.from_dlpack(buffer[0].detach())
-                            v_src = cp.from_dlpack(buffer[1].detach())
-                            
-                            # Get target slices and convert to cupy
-                            k_dst = cp.from_dlpack(gpu_tensor[0, dst_idx, ...].detach())
-                            v_dst = cp.from_dlpack(gpu_tensor[1, dst_idx, ...].detach())
-                            
-                            # Copy using cupy (bypasses PyTorch inference mode)
-                            cp.copyto(k_dst, k_src)
-                            cp.copyto(v_dst, v_src)
+                            # Copy to GPU cache using direct CUDA memcpy to bypass inference mode
+                            _cuda_memcpy(
+                                gpu_tensor[0, dst_idx, ...].data_ptr(),
+                                buffer[0].data_ptr(),
+                                buffer[0].nbytes,
+                            )
+                            _cuda_memcpy(
+                                gpu_tensor[1, dst_idx, ...].data_ptr(),
+                                buffer[1].data_ptr(),
+                                buffer[1].nbytes,
+                            )
                         else:
                             # Create buffer for reading
                             block_shape = gpu_tensor[dst_idx, ...].shape
@@ -358,15 +395,12 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                                     f"Incomplete read: expected {buffer.nbytes}, got {nbytes}"
                                 )
 
-                            # Copy to GPU cache using raw memory copy to bypass inference mode
-                            import cupy as cp
-                            
-                            # Get cupy arrays from torch tensors (zero-copy via DLPack)
-                            src = cp.from_dlpack(buffer.detach())
-                            dst = cp.from_dlpack(gpu_tensor[dst_idx, ...].detach())
-                            
-                            # Copy using cupy (bypasses PyTorch inference mode)
-                            cp.copyto(dst, src)
+                            # Copy to GPU cache using direct CUDA memcpy to bypass inference mode
+                            _cuda_memcpy(
+                                gpu_tensor[dst_idx, ...].data_ptr(),
+                                buffer.data_ptr(),
+                                buffer.nbytes,
+                            )
 
             return True
         except Exception as e:
