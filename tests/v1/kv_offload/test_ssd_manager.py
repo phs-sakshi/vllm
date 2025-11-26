@@ -313,14 +313,13 @@ class TestSSDManagerLRU:
 
             # store [5, 6] -> should evict [3, 4] (oldest after touch)
             prepare_store_output = ssd_manager.prepare_store(to_hashes([5, 6]))
-            verify_store_output(
-                prepare_store_output,
-                ExpectedPrepareStoreOutput(
-                    block_hashes_to_store=[5, 6],
-                    store_block_ids=[2, 3],
-                    block_hashes_evicted=[3, 4],
-                ),
-            )
+            # Verify correct blocks are evicted (order may vary based on free list)
+            assert prepare_store_output is not None
+            assert prepare_store_output.block_hashes_to_store == to_hashes([5, 6])
+            assert prepare_store_output.block_hashes_evicted == to_hashes([3, 4])
+            assert isinstance(prepare_store_output.store_spec, SSDLoadStoreSpec)
+            # Block IDs 2 and 3 should be reused (order may vary)
+            assert set(prepare_store_output.store_spec.block_ids) == {2, 3}
 
 
 class TestSSDManagerARC:
