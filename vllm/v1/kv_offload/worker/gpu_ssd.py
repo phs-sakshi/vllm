@@ -27,37 +27,36 @@ logger = init_logger(__name__)
 
 # Lazy import kvikio to avoid loading if not used
 _kvikio_available = None
-_cufile = None
+_kvikio = None
 
 
 def _check_kvikio_available() -> bool:
     """Check if kvikio is available and GDS is supported."""
-    global _kvikio_available, _cufile
+    global _kvikio_available, _kvikio
     if _kvikio_available is not None:
         return _kvikio_available
 
     try:
         import kvikio
-        import kvikio.cufile as cufile
 
-        _cufile = cufile
+        _kvikio = kvikio
         _kvikio_available = True
 
         # Check if GDS is available
         try:
-            driver_props = kvikio.DriverProperties()
-            if driver_props.is_gds_available:
-                logger.info(
-                    "GPU Direct Storage (GDS) is available. "
-                    "Major version: %d, Minor version: %d",
-                    driver_props.major_version,
-                    driver_props.minor_version,
-                )
-            else:
-                logger.warning(
-                    "GDS driver not available. Falling back to compatibility mode. "
-                    "For best performance, install and configure GDS."
-                )
+            if hasattr(kvikio, 'DriverProperties'):
+                driver_props = kvikio.DriverProperties()
+                if driver_props.is_gds_available:
+                    logger.info(
+                        "GPU Direct Storage (GDS) is available. "
+                        "Major version: %d, Minor version: %d",
+                        driver_props.major_version,
+                        driver_props.minor_version,
+                    )
+                else:
+                    logger.warning(
+                        "GDS driver not available. Falling back to compatibility mode."
+                    )
         except Exception as e:
             logger.warning("Could not query GDS driver properties: %s", e)
 
@@ -82,15 +81,6 @@ def expand_block_ids(
     """
     Convert a list of block IDs to a list of matching block ids,
     assuming each block is composed of actual block_size_factor blocks.
-    Outputs to output tensor.
-    The first skip_count blocks will be skipped.
-    Note that skip_count must be less than block_size_factor.
-
-    For example, if block_ids = [0, 1, 3] and block_size_factor = 4,
-    then it yields [0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15]
-    since 0 maps to [0, 1, 2, 3]
-    1 maps to [4, 5, 6, 7]
-    and 3 maps to [12, 13, 14, 15]
     """
     assert skip_count < block_size_factor
 
@@ -107,22 +97,7 @@ def expand_block_ids(
 
 
 class GpuSsdOffloadingHandler(OffloadingHandler):
-    """Handler for GPU-SSD KV cache transfers using GPU Direct Storage.
-
-    This handler uses kvikio (NVIDIA RAPIDS) to perform direct GPU-to-SSD
-    data transfers without going through CPU memory, significantly reducing
-    latency and CPU overhead.
-
-    Args:
-        gpu_block_size: Block size in tokens for GPU cache.
-        ssd_block_size: Block size in tokens for SSD cache.
-        num_ssd_blocks: Number of blocks allocated on SSD.
-        gpu_caches: Dictionary mapping layer names to GPU KV cache tensors.
-        attn_backends: Dictionary mapping layer names to attention backends.
-        ssd_cache_dir: Directory path for SSD cache files.
-        cache_file_prefix: Prefix for cache file names.
-        num_io_threads: Number of threads for async I/O operations.
-    """
+    """Handler for GPU-SSD KV cache transfers using GPU Direct Storage."""
 
     def __init__(
         self,
@@ -143,6 +118,7 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
 
         assert ssd_block_size % gpu_block_size == 0
         self.block_size_factor = ssd_block_size // gpu_block_size
+        self.gpu_block_size = gpu_block_size
 
         # Thread pool for async I/O operations
         self.io_executor = ThreadPoolExecutor(
@@ -162,7 +138,7 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
         self.gpu_tensors: list[torch.Tensor] = []
         self.kv_dim_before_num_blocks: list[bool] = []
         self.block_sizes_bytes: list[int] = []
-        self.ssd_files: list["_cufile.CuFile"] = []
+        self.ssd_file_paths: list[Path] = []
 
         for layer_idx, (layer_name, gpu_tensor) in enumerate(gpu_caches.items()):
             self.gpu_tensors.append(gpu_tensor)
@@ -174,72 +150,53 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
             )
 
             if len(gpu_shape) != len(test_shape):
-                # cross-layers tensor
-                # shape is (num_blocks, ...)
-                assert len(gpu_shape) == len(test_shape) + 1
                 num_blocks_idx = 0
                 self.kv_dim_before_num_blocks.append(False)
             elif test_shape[0] == 1234:
-                # shape is (num_blocks, ...)
                 num_blocks_idx = 0
                 self.kv_dim_before_num_blocks.append(False)
             else:
-                # shape should be (2, num_blocks, ...)
                 assert test_shape[0] == 2
                 assert test_shape[1] == 1234
                 assert gpu_shape[0] == 2
                 num_blocks_idx = 1
                 self.kv_dim_before_num_blocks.append(True)
 
-            # Calculate block size in bytes
-            # For a single block, we need to figure out the memory footprint
+            # Calculate block size in bytes for a single GPU block
             block_shape = list(gpu_shape)
-            block_shape[num_blocks_idx] = 1  # Single block
+            block_shape[num_blocks_idx] = 1
             single_block_elements = 1
             for dim in block_shape:
                 single_block_elements *= dim
-            block_size_bytes = single_block_elements * gpu_tensor.element_size()
-
-            # Account for block_size_factor (SSD block = multiple GPU blocks)
-            ssd_block_size_bytes = block_size_bytes * self.block_size_factor
-            self.block_sizes_bytes.append(ssd_block_size_bytes)
+            gpu_block_size_bytes = single_block_elements * gpu_tensor.element_size()
+            self.block_sizes_bytes.append(gpu_block_size_bytes)
 
             # Create cache file for this layer
             cache_file_path = (
                 self.ssd_cache_dir / f"{cache_file_prefix}_layer_{layer_idx}.bin"
             )
+            self.ssd_file_paths.append(cache_file_path)
 
-            # Pre-allocate the cache file
-            total_size = ssd_block_size_bytes * num_ssd_blocks
+            # Pre-allocate the cache file - need space for all SSD blocks
+            # Each SSD block = block_size_factor GPU blocks
+            total_size = gpu_block_size_bytes * self.block_size_factor * num_ssd_blocks
             self._create_cache_file(cache_file_path, total_size)
 
-            # Open with kvikio for GDS access
-            ssd_file = _cufile.CuFile(cache_file_path, "r+")
-            self.ssd_files.append(ssd_file)
-
             logger.debug(
-                "Layer %d: block_size=%d bytes, total=%d bytes, file=%s",
+                "Layer %d: gpu_block_size=%d bytes, total=%d bytes, file=%s",
                 layer_idx,
-                ssd_block_size_bytes,
+                gpu_block_size_bytes,
                 total_size,
                 cache_file_path,
             )
 
     def _create_cache_file(self, path: Path, size: int):
-        """Create a pre-allocated cache file for GDS.
-
-        Args:
-            path: Path to the cache file.
-            size: Total size of the file in bytes.
-        """
-        # Use fallocate for efficient pre-allocation if available
+        """Create a pre-allocated cache file for GDS."""
         try:
             with open(path, "wb") as f:
-                # Pre-allocate file with fallocate (Linux)
                 try:
                     os.posix_fallocate(f.fileno(), 0, size)
                 except (AttributeError, OSError):
-                    # Fallback: write zeros
                     f.seek(size - 1)
                     f.write(b"\0")
             logger.debug("Created cache file %s with size %d bytes", path, size)
@@ -247,70 +204,40 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
             logger.error("Failed to create cache file %s: %s", path, e)
             raise
 
-    def _get_block_slice(
-        self, tensor: torch.Tensor, block_ids: np.ndarray, kv_dim_before: bool
-    ) -> torch.Tensor:
-        """Get a view of the tensor containing the specified blocks.
-
-        Args:
-            tensor: The KV cache tensor.
-            block_ids: Array of block IDs to extract.
-            kv_dim_before: Whether KV dimension comes before num_blocks.
-
-        Returns:
-            View of the tensor containing the specified blocks.
-        """
-        if kv_dim_before:
-            # Shape: (2, num_blocks, ...)
-            # Get both K and V for the specified blocks
-            return tensor[:, block_ids, ...]
-        else:
-            # Shape: (num_blocks, ...) or (num_blocks, 2, ...)
-            return tensor[block_ids, ...]
-
     def _do_gpu_to_ssd_transfer(
         self,
         src_block_ids: np.ndarray,
         dst_block_ids: np.ndarray,
     ) -> bool:
-        """Perform GPU to SSD transfer for specified blocks.
-
-        Args:
-            src_block_ids: Source block IDs in GPU memory.
-            dst_block_ids: Destination block IDs in SSD storage.
-
-        Returns:
-            True if transfer was successful.
-        """
+        """Perform GPU to SSD transfer for specified blocks."""
         try:
-            for layer_idx, (gpu_tensor, ssd_file, block_size, kv_dim) in enumerate(
+            for layer_idx, (gpu_tensor, file_path, block_size_bytes, kv_dim) in enumerate(
                 zip(
                     self.gpu_tensors,
-                    self.ssd_files,
+                    self.ssd_file_paths,
                     self.block_sizes_bytes,
                     self.kv_dim_before_num_blocks,
                 )
             ):
-                for src_block, dst_block in zip(src_block_ids, dst_block_ids):
-                    # Calculate file offset for destination block
-                    # Convert to Python int for kvikio compatibility
-                    src_idx = int(src_block)
-                    file_offset = int(dst_block) * block_size
+                # Open file for this transfer
+                with _kvikio.CuFile(file_path, "r+") as ssd_file:
+                    for src_block, dst_block in zip(src_block_ids, dst_block_ids):
+                        src_idx = int(src_block)
+                        dst_idx = int(dst_block)
+                        file_offset = dst_idx * block_size_bytes
 
-                    # Get the source block data from GPU
-                    if kv_dim:
-                        # For (2, num_blocks, ...) layout
-                        k_data = gpu_tensor[0, src_idx : src_idx + 1, ...]
-                        v_data = gpu_tensor[1, src_idx : src_idx + 1, ...]
-                        # Stack K and V together for single write
-                        block_data = torch.cat([k_data, v_data], dim=0).contiguous()
-                    else:
-                        block_data = gpu_tensor[
-                            src_idx : src_idx + 1, ...
-                        ].contiguous()
+                        # Get the source block data from GPU and make a contiguous copy
+                        if kv_dim:
+                            k_data = gpu_tensor[0, src_idx, ...].contiguous().clone()
+                            v_data = gpu_tensor[1, src_idx, ...].contiguous().clone()
+                            block_data = torch.cat(
+                                [k_data.unsqueeze(0), v_data.unsqueeze(0)], dim=0
+                            ).contiguous()
+                        else:
+                            block_data = gpu_tensor[src_idx, ...].contiguous().clone()
 
-                    # Write to SSD using GDS
-                    ssd_file.pwrite(block_data, file_offset)
+                        # Write to SSD using GDS
+                        ssd_file.pwrite(block_data, file_offset)
 
             return True
         except Exception as e:
@@ -322,50 +249,52 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
         src_block_ids: np.ndarray,
         dst_block_ids: np.ndarray,
     ) -> bool:
-        """Perform SSD to GPU transfer for specified blocks.
-
-        Args:
-            src_block_ids: Source block IDs in SSD storage.
-            dst_block_ids: Destination block IDs in GPU memory.
-
-        Returns:
-            True if transfer was successful.
-        """
+        """Perform SSD to GPU transfer for specified blocks."""
         try:
-            for layer_idx, (gpu_tensor, ssd_file, block_size, kv_dim) in enumerate(
+            for layer_idx, (gpu_tensor, file_path, block_size_bytes, kv_dim) in enumerate(
                 zip(
                     self.gpu_tensors,
-                    self.ssd_files,
+                    self.ssd_file_paths,
                     self.block_sizes_bytes,
                     self.kv_dim_before_num_blocks,
                 )
             ):
-                for src_block, dst_block in zip(src_block_ids, dst_block_ids):
-                    # Calculate file offset for source block
-                    # Convert to Python int for kvikio compatibility
-                    dst_idx = int(dst_block)
-                    file_offset = int(src_block) * block_size
+                # Open file for this transfer
+                with _kvikio.CuFile(file_path, "r") as ssd_file:
+                    for src_block, dst_block in zip(src_block_ids, dst_block_ids):
+                        src_idx = int(src_block)
+                        dst_idx = int(dst_block)
+                        file_offset = src_idx * block_size_bytes
 
-                    if kv_dim:
-                        # For (2, num_blocks, ...) layout, read K and V
-                        k_data = gpu_tensor[0, dst_idx : dst_idx + 1, ...]
-                        v_data = gpu_tensor[1, dst_idx : dst_idx + 1, ...]
+                        if kv_dim:
+                            # Create buffer matching the file layout
+                            k_shape = gpu_tensor[0, dst_idx, ...].shape
+                            buffer = torch.empty(
+                                (2,) + k_shape,
+                                dtype=gpu_tensor.dtype,
+                                device=gpu_tensor.device,
+                            )
 
-                        # Create a temporary buffer for reading
-                        block_data = torch.cat(
-                            [k_data.clone(), v_data.clone()], dim=0
-                        ).contiguous()
+                            # Read from SSD
+                            ssd_file.pread(buffer, file_offset)
 
-                        # Read from SSD using GDS
-                        ssd_file.pread(block_data, file_offset)
+                            # Copy to GPU cache
+                            gpu_tensor[0, dst_idx, ...].copy_(buffer[0])
+                            gpu_tensor[1, dst_idx, ...].copy_(buffer[1])
+                        else:
+                            # Create buffer for reading
+                            block_shape = gpu_tensor[dst_idx, ...].shape
+                            buffer = torch.empty(
+                                block_shape,
+                                dtype=gpu_tensor.dtype,
+                                device=gpu_tensor.device,
+                            )
 
-                        # Split and copy back to K and V caches
-                        k_data.copy_(block_data[0:1, ...])
-                        v_data.copy_(block_data[1:2, ...])
-                    else:
-                        # Direct read into GPU tensor
-                        dst_slice = gpu_tensor[dst_idx : dst_idx + 1, ...]
-                        ssd_file.pread(dst_slice.contiguous(), file_offset)
+                            # Read from SSD
+                            ssd_file.pread(buffer, file_offset)
+
+                            # Copy to GPU cache
+                            gpu_tensor[dst_idx, ...].copy_(buffer)
 
             return True
         except Exception as e:
@@ -373,15 +302,7 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
             return False
 
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
-        """Initiate an asynchronous transfer.
-
-        Args:
-            job_id: Unique ID for tracking this transfer.
-            spec: Transfer specification (source, destination).
-
-        Returns:
-            True if transfer was successfully initiated.
-        """
+        """Initiate an asynchronous transfer."""
         src_spec, dst_spec = spec
 
         if isinstance(src_spec, SSDLoadStoreSpec):
@@ -399,11 +320,9 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
 
         # Handle block size factor conversion
         if is_read:
-            # SSD -> GPU: SSD blocks are larger
             src_block_size_factor = self.block_size_factor
             dst_block_size_factor = 1
         else:
-            # GPU -> SSD: GPU blocks are smaller
             src_block_size_factor = 1
             dst_block_size_factor = self.block_size_factor
 
@@ -435,11 +354,7 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
         return True
 
     def get_finished(self) -> list[TransferResult]:
-        """Get list of completed transfers.
-
-        Returns:
-            List of (job_id, success) tuples for completed transfers.
-        """
+        """Get list of completed transfers."""
         results: list[TransferResult] = []
         completed_jobs = []
 
@@ -460,21 +375,12 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
 
     def close(self):
         """Clean up resources."""
-        # Wait for pending transfers
         for future in self.pending_transfers.values():
             try:
                 future.result(timeout=30)
             except Exception as e:
                 logger.warning("Transfer did not complete during cleanup: %s", e)
 
-        # Close SSD files
-        for ssd_file in self.ssd_files:
-            try:
-                ssd_file.close()
-            except Exception as e:
-                logger.warning("Failed to close SSD file: %s", e)
-
-        # Shutdown thread pool
         self.io_executor.shutdown(wait=True)
 
     def __del__(self):
