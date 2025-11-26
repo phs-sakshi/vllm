@@ -293,18 +293,20 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
             ):
                 for src_block, dst_block in zip(src_block_ids, dst_block_ids):
                     # Calculate file offset for destination block
-                    file_offset = dst_block * block_size
+                    # Convert to Python int for kvikio compatibility
+                    src_idx = int(src_block)
+                    file_offset = int(dst_block) * block_size
 
                     # Get the source block data from GPU
                     if kv_dim:
                         # For (2, num_blocks, ...) layout
-                        k_data = gpu_tensor[0, src_block : src_block + 1, ...]
-                        v_data = gpu_tensor[1, src_block : src_block + 1, ...]
+                        k_data = gpu_tensor[0, src_idx : src_idx + 1, ...]
+                        v_data = gpu_tensor[1, src_idx : src_idx + 1, ...]
                         # Stack K and V together for single write
                         block_data = torch.cat([k_data, v_data], dim=0).contiguous()
                     else:
                         block_data = gpu_tensor[
-                            src_block : src_block + 1, ...
+                            src_idx : src_idx + 1, ...
                         ].contiguous()
 
                     # Write to SSD using GDS
@@ -340,12 +342,14 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
             ):
                 for src_block, dst_block in zip(src_block_ids, dst_block_ids):
                     # Calculate file offset for source block
-                    file_offset = src_block * block_size
+                    # Convert to Python int for kvikio compatibility
+                    dst_idx = int(dst_block)
+                    file_offset = int(src_block) * block_size
 
                     if kv_dim:
                         # For (2, num_blocks, ...) layout, read K and V
-                        k_data = gpu_tensor[0, dst_block : dst_block + 1, ...]
-                        v_data = gpu_tensor[1, dst_block : dst_block + 1, ...]
+                        k_data = gpu_tensor[0, dst_idx : dst_idx + 1, ...]
+                        v_data = gpu_tensor[1, dst_idx : dst_idx + 1, ...]
 
                         # Create a temporary buffer for reading
                         block_data = torch.cat(
@@ -360,7 +364,7 @@ class GpuSsdOffloadingHandler(OffloadingHandler):
                         v_data.copy_(block_data[1:2, ...])
                     else:
                         # Direct read into GPU tensor
-                        dst_slice = gpu_tensor[dst_block : dst_block + 1, ...]
+                        dst_slice = gpu_tensor[dst_idx : dst_idx + 1, ...]
                         ssd_file.pread(dst_slice.contiguous(), file_offset)
 
             return True
