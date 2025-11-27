@@ -37,10 +37,9 @@ except ImportError:
     pass
 
 SSD_BLOCK_SIZES = [48]
+# Only use FLASH_ATTN for SSD offloading tests
+# FLASHINFER has JIT compilation requirements that may not be met in all environments
 ATTN_BACKENDS = ["FLASH_ATTN"]
-
-if current_platform.is_cuda():
-    ATTN_BACKENDS.append("FLASHINFER")
 
 
 class MockSubscriber:
