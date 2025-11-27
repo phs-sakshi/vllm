@@ -4,9 +4,6 @@
 Integration tests for SSD offloading - mirrors test_cpu_offloading.py structure.
 
 Usage:
-    python tests/v1/kv_offload/test_ssd_integration.py
-    
-Or with pytest:
     python -m pytest tests/v1/kv_offload/test_ssd_integration.py -v -s
 """
 
@@ -236,6 +233,3 @@ def test_ssd_offloading(ssd_block_size: int, attn_backend: str) -> None:
             del llm
 
 
-if __name__ == "__main__":
-    import sys
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
